@@ -2,12 +2,11 @@ package exported_fields
 
 // Used for testing exportedFields.
 // Its exported fields are:
-//
-//	A1 [1]int
-//	D bool
-//	E int
-//	F F
-//	S *S
+//   A1 [1]int
+//   D bool
+//   E int
+//   F F
+//   S *S
 type (
 	S struct {
 		int

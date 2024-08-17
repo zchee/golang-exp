@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // TODO: test swap corresponding types (e.g. u1 <-> u2 and u2 <-> u1)
 // TODO: test exported alias refers to something in another package -- does correspondence work then?
 // TODO: CODE COVERAGE
@@ -16,32 +20,20 @@ import (
 	"go/token"
 	"go/types"
 	"strings"
-
-	"golang.org/x/tools/go/types/typeutil"
 )
 
 // Changes reports on the differences between the APIs of the old and new packages.
 // It classifies each difference as either compatible or incompatible (breaking.) For
-// a detailed discussion of what constitutes an incompatible change, see the README.
+// a detailed discussion of what constitutes an incompatible change, see the package
+// documentation.
 func Changes(old, new *types.Package) Report {
-	return changesInternal(old, new, old.Path(), new.Path())
-}
-
-// changesInternal contains the core logic for comparing a single package, shared
-// between Changes and ModuleChanges. The root package path arguments refer to the
-// context of this apidiff invocation - when diffing a single package, they will be
-// that package, but when diffing a whole module, they will be the root path of the
-// module. This is used to give change messages appropriate context for object names.
-// The old and new root must be tracked independently, since each side of the diff
-// operation may be a different path.
-func changesInternal(old, new *types.Package, oldRootPackagePath, newRootPackagePath string) Report {
 	d := newDiffer(old, new)
-	d.checkPackage(oldRootPackagePath)
+	d.checkPackage()
 	r := Report{}
-	for _, m := range d.incompatibles.collect(oldRootPackagePath, newRootPackagePath) {
+	for _, m := range d.incompatibles.collect() {
 		r.Changes = append(r.Changes, Change{Message: m, Compatible: false})
 	}
-	for _, m := range d.compatibles.collect(oldRootPackagePath, newRootPackagePath) {
+	for _, m := range d.compatibles.collect() {
 		r.Changes = append(r.Changes, Change{Message: m, Compatible: true})
 	}
 	return r
@@ -67,7 +59,7 @@ func ModuleChanges(old, new *Module) Report {
 	for n, op := range oldPkgs {
 		if np, ok := newPkgs[n]; ok {
 			// shared package, compare surfaces
-			rr := changesInternal(op, np, old.Path, new.Path)
+			rr := Changes(op, np)
 			r.Changes = append(r.Changes, rr.Changes...)
 		} else {
 			// old package was removed
@@ -110,7 +102,7 @@ type differ struct {
 	// Even though it is the named types (*types.Named) that correspond, we use
 	// *types.TypeName as a map key because they are canonical.
 	// The values can be either named types or basic types.
-	correspondMap typeutil.Map
+	correspondMap map[*types.TypeName]types.Type
 
 	// Messages.
 	incompatibles messageSet
@@ -121,51 +113,26 @@ func newDiffer(old, new *types.Package) *differ {
 	return &differ{
 		old:           old,
 		new:           new,
+		correspondMap: map[*types.TypeName]types.Type{},
 		incompatibles: messageSet{},
 		compatibles:   messageSet{},
 	}
 }
 
-func (d *differ) incompatible(obj objectWithSide, part, format string, args ...interface{}) {
+func (d *differ) incompatible(obj types.Object, part, format string, args ...interface{}) {
 	addMessage(d.incompatibles, obj, part, format, args)
 }
 
-func (d *differ) compatible(obj objectWithSide, part, format string, args ...interface{}) {
+func (d *differ) compatible(obj types.Object, part, format string, args ...interface{}) {
 	addMessage(d.compatibles, obj, part, format, args)
 }
 
-func addMessage(ms messageSet, obj objectWithSide, part, format string, args []interface{}) {
+func addMessage(ms messageSet, obj types.Object, part, format string, args []interface{}) {
 	ms.add(obj, part, fmt.Sprintf(format, args...))
 }
 
-func (d *differ) checkPackage(oldRootPackagePath string) {
-	// Determine what has changed between old and new.
-
-	// First, establish correspondences between types with the same name, before
-	// looking at aliases. This will avoid confusing messages like "T: changed
-	// from T to T", which can happen if a correspondence between an alias
-	// and a named type is established first.
-	// See testdata/order.go.
-	for _, name := range d.old.Scope().Names() {
-		oldobj := d.old.Scope().Lookup(name)
-		if tn, ok := oldobj.(*types.TypeName); ok {
-			if oldn, ok := tn.Type().(*types.Named); ok {
-				if !oldn.Obj().Exported() {
-					continue
-				}
-				// Does new have a named type of the same name? Look up using
-				// the old named type's name, oldn.Obj().Name(), not the
-				// TypeName tn, which may be an alias.
-				newobj := d.new.Scope().Lookup(oldn.Obj().Name())
-				if newobj != nil {
-					d.checkObjects(oldobj, newobj)
-				}
-			}
-		}
-	}
-
-	// Next, look at all exported symbols in the old world and compare them
-	// with the same-named symbols in the new world.
+func (d *differ) checkPackage() {
+	// Old changes.
 	for _, name := range d.old.Scope().Names() {
 		oldobj := d.old.Scope().Lookup(name)
 		if !oldobj.Exported() {
@@ -173,52 +140,43 @@ func (d *differ) checkPackage(oldRootPackagePath string) {
 		}
 		newobj := d.new.Scope().Lookup(name)
 		if newobj == nil {
-			d.incompatible(objectWithSide{oldobj, false}, "", "removed")
+			d.incompatible(oldobj, "", "removed")
 			continue
 		}
 		d.checkObjects(oldobj, newobj)
 	}
-
-	// Now look at what has been added in the new package.
+	// New additions.
 	for _, name := range d.new.Scope().Names() {
 		newobj := d.new.Scope().Lookup(name)
 		if newobj.Exported() && d.old.Scope().Lookup(name) == nil {
-			d.compatible(objectWithSide{newobj, true}, "", "added")
+			d.compatible(newobj, "", "added")
 		}
 	}
 
 	// Whole-package satisfaction.
 	// For every old exposed interface oIface and its corresponding new interface nIface...
-	d.correspondMap.Iterate(func(k1 types.Type, v1 any) {
-		ot1 := k1.(*types.Named)
-		otn1 := ot1.Obj()
-		nt1 := v1.(types.Type)
+	for otn1, nt1 := range d.correspondMap {
 		oIface, ok := otn1.Type().Underlying().(*types.Interface)
 		if !ok {
-			return
+			continue
 		}
 		nIface, ok := nt1.Underlying().(*types.Interface)
 		if !ok {
 			// If nt1 isn't an interface but otn1 is, then that's an incompatibility that
 			// we've already noticed, so there's no need to do anything here.
-			return
+			continue
 		}
 		// For every old type that implements oIface, its corresponding new type must implement
 		// nIface.
-		d.correspondMap.Iterate(func(k2 types.Type, v2 any) {
-			ot2 := k2.(*types.Named)
-			otn2 := ot2.Obj()
-			nt2 := v2.(types.Type)
+		for otn2, nt2 := range d.correspondMap {
 			if otn1 == otn2 {
-				return
+				continue
 			}
 			if types.Implements(otn2.Type(), oIface) && !types.Implements(nt2, nIface) {
-				// TODO(jba): the type name is not sufficient information here; we need the type args
-				// if this is an instantiated generic type.
-				d.incompatible(objectWithSide{otn2, false}, "", "no longer implements %s", objectString(otn1, oldRootPackagePath))
+				d.incompatible(otn2, "", "no longer implements %s", objectString(otn1))
 			}
-		})
-	})
+		}
+	}
 }
 
 func (d *differ) checkObjects(old, new types.Object) {
@@ -230,30 +188,30 @@ func (d *differ) checkObjects(old, new types.Object) {
 		}
 	case *types.Var:
 		if new, ok := new.(*types.Var); ok {
-			d.checkCorrespondence(objectWithSide{old, false}, "", old.Type(), new.Type())
+			d.checkCorrespondence(old, "", old.Type(), new.Type())
 			return
 		}
 	case *types.Func:
 		switch new := new.(type) {
 		case *types.Func:
-			d.checkCorrespondence(objectWithSide{old, false}, "", old.Type(), new.Type())
+			d.checkCorrespondence(old, "", old.Type(), new.Type())
 			return
 		case *types.Var:
-			d.compatible(objectWithSide{old, false}, "", "changed from func to var")
-			d.checkCorrespondence(objectWithSide{old, false}, "", old.Type(), new.Type())
+			d.compatible(old, "", "changed from func to var")
+			d.checkCorrespondence(old, "", old.Type(), new.Type())
 			return
 
 		}
 	case *types.TypeName:
 		if new, ok := new.(*types.TypeName); ok {
-			d.checkCorrespondence(objectWithSide{old, false}, "", old.Type(), new.Type())
+			d.checkCorrespondence(old, "", old.Type(), new.Type())
 			return
 		}
 	default:
 		panic("unexpected obj type")
 	}
 	// Here if kind of type changed.
-	d.incompatible(objectWithSide{old, false}, "", "changed from %s to %s",
+	d.incompatible(old, "", "changed from %s to %s",
 		objectKindString(old), objectKindString(new))
 }
 
@@ -263,13 +221,13 @@ func (d *differ) constChanges(old, new *types.Const) {
 	nt := new.Type()
 	// Check for change of type.
 	if !d.correspond(ot, nt) {
-		d.typeChanged(objectWithSide{old, false}, "", ot, nt)
+		d.typeChanged(old, "", ot, nt)
 		return
 	}
 	// Check for change of value.
 	// We know the types are the same, so constant.Compare shouldn't panic.
 	if !constant.Compare(old.Val(), token.EQL, new.Val()) {
-		d.incompatible(objectWithSide{old, false}, "", "value changed from %s to %s", old.Val(), new.Val())
+		d.incompatible(old, "", "value changed from %s to %s", old.Val(), new.Val())
 	}
 }
 
@@ -288,13 +246,13 @@ func objectKindString(obj types.Object) string {
 	}
 }
 
-func (d *differ) checkCorrespondence(obj objectWithSide, part string, old, new types.Type) {
+func (d *differ) checkCorrespondence(obj types.Object, part string, old, new types.Type) {
 	if !d.correspond(old, new) {
 		d.typeChanged(obj, part, old, new)
 	}
 }
 
-func (d *differ) typeChanged(obj objectWithSide, part string, old, new types.Type) {
+func (d *differ) typeChanged(obj types.Object, part string, old, new types.Type) {
 	old = removeNamesFromSignature(old)
 	new = removeNamesFromSignature(new)
 	olds := types.TypeString(old, types.RelativeTo(d.old))
@@ -306,6 +264,7 @@ func (d *differ) typeChanged(obj objectWithSide, part string, old, new types.Typ
 // Since these can change without affecting compatibility, we don't want users to
 // be distracted by them, so we remove them.
 func removeNamesFromSignature(t types.Type) types.Type {
+	t = types.Unalias(t)
 	sig, ok := t.(*types.Signature)
 	if !ok {
 		return t
@@ -315,10 +274,10 @@ func removeNamesFromSignature(t types.Type) types.Type {
 		var vars []*types.Var
 		for i := 0; i < p.Len(); i++ {
 			v := p.At(i)
-			vars = append(vars, types.NewVar(v.Pos(), v.Pkg(), "", v.Type()))
+			vars = append(vars, types.NewVar(v.Pos(), v.Pkg(), "", types.Unalias(v.Type())))
 		}
 		return types.NewTuple(vars...)
 	}
 
-	return types.NewSignature(sig.Recv(), dename(sig.Params()), dename(sig.Results()), sig.Variadic())
+	return types.NewSignatureType(sig.Recv(), nil, nil, dename(sig.Params()), dename(sig.Results()), sig.Variadic())
 }

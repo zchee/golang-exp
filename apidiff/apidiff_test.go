@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package apidiff
 
 import (
@@ -53,7 +57,7 @@ func testModuleChanges(t *testing.T, x packagestest.Exporter) {
 		t.Fatal("expected some changes, but got none")
 	}
 	wanti := []string{
-		"./foo.Version: value changed from 1 to 2",
+		"Version: value changed from 1 to 2",
 		"package example.com/moda/foo/baz: removed",
 	}
 	sort.Strings(wanti)
@@ -66,7 +70,7 @@ func testModuleChanges(t *testing.T, x packagestest.Exporter) {
 	}
 
 	wantc := []string{
-		"./foo.Other: added",
+		"Other: added",
 		"package example.com/modb/bar: added",
 	}
 	sort.Strings(wantc)
@@ -80,47 +84,43 @@ func testModuleChanges(t *testing.T, x packagestest.Exporter) {
 }
 
 func TestChanges(t *testing.T) {
-	testfiles, err := filepath.Glob(filepath.Join("testdata", "*.go"))
+	dir, err := os.MkdirTemp("", "apidiff_test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, testfile := range testfiles {
-		name := strings.TrimSuffix(filepath.Base(testfile), ".go")
-		t.Run(name, func(t *testing.T) {
-			dir := filepath.Join(t.TempDir(), "go")
-			wanti, wantc := splitIntoPackages(t, testfile, dir)
-			sort.Strings(wanti)
-			sort.Strings(wantc)
+	dir = filepath.Join(dir, "go")
+	wanti, wantc := splitIntoPackages(t, dir)
+	defer os.RemoveAll(dir)
+	sort.Strings(wanti)
+	sort.Strings(wantc)
 
-			oldpkg, err := loadPackage(t, "apidiff/old", dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			newpkg, err := loadPackage(t, "apidiff/new", dir)
-			if err != nil {
-				t.Fatal(err)
-			}
+	oldpkg, err := loadPackage(t, "apidiff/old", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newpkg, err := loadPackage(t, "apidiff/new", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			report := Changes(oldpkg.Types, newpkg.Types)
+	report := Changes(oldpkg.Types, newpkg.Types)
 
-			got := report.messages(false)
-			if diff := cmp.Diff(wanti, got); diff != "" {
-				t.Errorf("incompatibles: mismatch (-want, +got)\n%s", diff)
-			}
-			got = report.messages(true)
-			if diff := cmp.Diff(wantc, got); diff != "" {
-				t.Errorf("compatibles: mismatch (-want, +got)\n%s", diff)
-			}
-		})
+	got := report.messages(false)
+	if diff := cmp.Diff(wanti, got); diff != "" {
+		t.Errorf("incompatibles (-want +got):\n%s", diff)
+	}
+	got = report.messages(true)
+	if diff := cmp.Diff(wantc, got); diff != "" {
+		t.Errorf("compatibles (-want +got):\n%s", diff)
 	}
 }
 
-func splitIntoPackages(t *testing.T, file, dir string) (incompatibles, compatibles []string) {
+func splitIntoPackages(t *testing.T, dir string) (incompatibles, compatibles []string) {
 	// Read the input file line by line.
 	// Write a line into the old or new package,
 	// dependent on comments.
 	// Also collect expected messages.
-	f, err := os.Open(file)
+	f, err := os.Open("testdata/tests.go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func splitIntoPackages(t *testing.T, file, dir string) (incompatibles, compatibl
 	if err := os.MkdirAll(filepath.Join(dir, "src", "apidiff"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "src", "apidiff", "go.mod"), []byte("module apidiff\ngo 1.18\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "src", "apidiff", "go.mod"), []byte("module apidiff\n"), 0666); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,21 +146,10 @@ func splitIntoPackages(t *testing.T, file, dir string) (incompatibles, compatibl
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		if err := oldf.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
 	newf, err := os.Create(filepath.Join(newd, "new.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		if err := newf.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}()
 
 	wl := func(f *os.File, line string) {
 		if _, err := fmt.Fprintln(f, line); err != nil {
@@ -198,7 +187,7 @@ func splitIntoPackages(t *testing.T, file, dir string) (incompatibles, compatibl
 func loadModule(t *testing.T, cfg *packages.Config, modulePath string) (*Module, error) {
 	needsGoPackages(t)
 
-	cfg.Mode = cfg.Mode | packages.LoadTypes
+	cfg.Mode = cfg.Mode | packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes
 	loaded, err := packages.Load(cfg, fmt.Sprintf("%s/...", modulePath))
 	if err != nil {
 		return nil, err
@@ -222,7 +211,7 @@ func loadPackage(t *testing.T, importPath, goPath string) (*packages.Package, er
 	needsGoPackages(t)
 
 	cfg := &packages.Config{
-		Mode: packages.LoadTypes,
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes,
 	}
 	if goPath != "" {
 		cfg.Env = append(os.Environ(), "GOPATH="+goPath)

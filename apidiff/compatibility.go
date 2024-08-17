@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package apidiff
 
 import (
@@ -7,6 +11,8 @@ import (
 )
 
 func (d *differ) checkCompatible(otn *types.TypeName, old, new types.Type) {
+	old = types.Unalias(old)
+	new = types.Unalias(new)
 	switch old := old.(type) {
 	case *types.Interface:
 		if new, ok := new.(*types.Interface); ok {
@@ -16,7 +22,7 @@ func (d *differ) checkCompatible(otn *types.TypeName, old, new types.Type) {
 
 	case *types.Struct:
 		if new, ok := new.(*types.Struct); ok {
-			d.checkCompatibleStruct(objectWithSide{otn, false}, old, new)
+			d.checkCompatibleStruct(otn, old, new)
 			return
 		}
 
@@ -36,21 +42,21 @@ func (d *differ) checkCompatible(otn *types.TypeName, old, new types.Type) {
 		panic("unreachable")
 
 	default:
-		d.checkCorrespondence(objectWithSide{otn, false}, "", old, new)
+		d.checkCorrespondence(otn, "", old, new)
 		return
 
 	}
 	// Here if old and new are different kinds of types.
-	d.typeChanged(objectWithSide{otn, false}, "", old, new)
+	d.typeChanged(otn, "", old, new)
 }
 
 func (d *differ) checkCompatibleChan(otn *types.TypeName, old, new *types.Chan) {
-	d.checkCorrespondence(objectWithSide{otn, false}, ", element type", old.Elem(), new.Elem())
+	d.checkCorrespondence(otn, ", element type", old.Elem(), new.Elem())
 	if old.Dir() != new.Dir() {
 		if new.Dir() == types.SendRecv {
-			d.compatible(objectWithSide{otn, false}, "", "removed direction")
+			d.compatible(otn, "", "removed direction")
 		} else {
-			d.incompatible(objectWithSide{otn, false}, "", "changed direction")
+			d.incompatible(otn, "", "changed direction")
 		}
 	}
 }
@@ -63,9 +69,9 @@ func (d *differ) checkCompatibleBasic(otn *types.TypeName, old, new *types.Basic
 		return
 	}
 	if compatibleBasics[[2]types.BasicKind{old.Kind(), new.Kind()}] {
-		d.compatible(objectWithSide{otn, false}, "", "changed from %s to %s", old, new)
+		d.compatible(otn, "", "changed from %s to %s", old, new)
 	} else {
-		d.typeChanged(objectWithSide{otn, false}, "", old, new)
+		d.typeChanged(otn, "", old, new)
 	}
 }
 
@@ -118,7 +124,7 @@ func (d *differ) checkCompatibleInterface(otn *types.TypeName, old, new *types.I
 		// Perform an equivalence check, but with more information.
 		d.checkMethodSet(otn, old, new, additionsIncompatible)
 		if u := unexportedMethod(new); u != nil {
-			d.incompatible(objectWithSide{otn, false}, u.Name(), "added unexported method")
+			d.incompatible(otn, u.Name(), "added unexported method")
 		}
 	}
 }
@@ -134,14 +140,11 @@ func unexportedMethod(t *types.Interface) *types.Func {
 }
 
 // We need to check three things for structs:
-//
 //  1. The set of exported fields must be compatible. This ensures that keyed struct
 //     literals continue to compile. (There is no compatibility guarantee for unkeyed
 //     struct literals.)
-//
 //  2. The set of exported *selectable* fields must be compatible. This includes the exported
 //     fields of all embedded structs. This ensures that selections continue to compile.
-//
 //  3. If the old struct is comparable, so must the new one be. This ensures that equality
 //     expressions and uses of struct values as map keys continue to compile.
 //
@@ -150,7 +153,7 @@ func unexportedMethod(t *types.Interface) *types.Func {
 // struct.
 //
 // Field tags are ignored: they have no compile-time implications.
-func (d *differ) checkCompatibleStruct(obj objectWithSide, old, new *types.Struct) {
+func (d *differ) checkCompatibleStruct(obj types.Object, old, new *types.Struct) {
 	d.checkCompatibleObjectSets(obj, exportedFields(old), exportedFields(new))
 	d.checkCompatibleObjectSets(obj, exportedSelectableFields(old), exportedSelectableFields(new))
 	// Removing comparability from a struct is an incompatible change.
@@ -242,7 +245,7 @@ func unambiguousFields(structs []*types.Struct) map[string]*types.Var {
 
 // Anything removed or change from the old set is an incompatible change.
 // Anything added to the new set is a compatible change.
-func (d *differ) checkCompatibleObjectSets(obj objectWithSide, old, new map[string]types.Object) {
+func (d *differ) checkCompatibleObjectSets(obj types.Object, old, new map[string]types.Object) {
 	for name, oldo := range old {
 		newo := new[name]
 		if newo == nil {
@@ -267,7 +270,7 @@ func (d *differ) checkCompatibleDefined(otn *types.TypeName, old *types.Named, n
 		return
 	}
 	// Interface method sets are checked in checkCompatibleInterface.
-	if _, ok := old.Underlying().(*types.Interface); ok {
+	if types.IsInterface(old) {
 		return
 	}
 
@@ -286,7 +289,7 @@ func (d *differ) checkMethodSet(otn *types.TypeName, oldt, newt types.Type, addc
 	oldMethodSet := exportedMethods(oldt)
 	newMethodSet := exportedMethods(newt)
 	msname := otn.Name()
-	if _, ok := oldt.(*types.Pointer); ok {
+	if _, ok := types.Unalias(oldt).(*types.Pointer); ok {
 		msname = "*" + msname
 	}
 	for name, oldMethod := range oldMethodSet {
@@ -300,19 +303,20 @@ func (d *differ) checkMethodSet(otn *types.TypeName, oldt, newt types.Type, addc
 			// T and one for the embedded type U. We want both messages to appear,
 			// but the messageSet dedup logic will allow only one message for a given
 			// object. So use the part string to distinguish them.
-			if receiverNamedType(oldMethod).Obj() != otn {
+			recv := oldMethod.Type().(*types.Signature).Recv()
+			if _, named := receiverNamed(recv); named.Obj() != otn {
 				part = fmt.Sprintf(", method set of %s", msname)
 			}
-			d.incompatible(objectWithSide{oldMethod, false}, part, "removed")
+			d.incompatible(oldMethod, part, "removed")
 		} else {
-			obj := objectWithSide{oldMethod, false}
+			obj := oldMethod
 			// If a value method is changed to a pointer method and has a signature
 			// change, then we can get two messages for the same method definition: one
 			// for the value method set that says it's removed, and another for the
 			// pointer method set that says it changed. To keep both messages (since
 			// messageSet dedups), use newMethod for the second. (Slight hack.)
 			if !hasPointerReceiver(oldMethod) && hasPointerReceiver(newMethod) {
-				obj = objectWithSide{newMethod, true}
+				obj = newMethod
 			}
 			d.checkCorrespondence(obj, "", oldMethod.Type(), newMethod.Type())
 		}
@@ -322,20 +326,20 @@ func (d *differ) checkMethodSet(otn *types.TypeName, oldt, newt types.Type, addc
 	for name, newMethod := range newMethodSet {
 		if oldMethodSet[name] == nil {
 			if addcompat {
-				d.compatible(objectWithSide{newMethod, true}, "", "added")
+				d.compatible(newMethod, "", "added")
 			} else {
-				d.incompatible(objectWithSide{newMethod, true}, "", "added")
+				d.incompatible(newMethod, "", "added")
 			}
 		}
 	}
 }
 
 // exportedMethods collects all the exported methods of type's method set.
-func exportedMethods(t types.Type) map[string]types.Object {
-	m := map[string]types.Object{}
+func exportedMethods(t types.Type) map[string]*types.Func {
+	m := make(map[string]*types.Func)
 	ms := types.NewMethodSet(t)
 	for i := 0; i < ms.Len(); i++ {
-		obj := ms.At(i).Obj()
+		obj := ms.At(i).Obj().(*types.Func)
 		if obj.Exported() {
 			m[obj.Name()] = obj
 		}
@@ -343,22 +347,20 @@ func exportedMethods(t types.Type) map[string]types.Object {
 	return m
 }
 
-func receiverType(method types.Object) types.Type {
-	return method.Type().(*types.Signature).Recv().Type()
+func hasPointerReceiver(method *types.Func) bool {
+	isptr, _ := receiverNamed(method.Type().(*types.Signature).Recv())
+	return isptr
 }
 
-func receiverNamedType(method types.Object) *types.Named {
-	switch t := receiverType(method).(type) {
-	case *types.Pointer:
-		return t.Elem().(*types.Named)
-	case *types.Named:
-		return t
-	default:
-		panic("unreachable")
+// ReceiverNamed returns the named type (if any) associated with the
+// type of recv, which may be of the form N or *N, or aliases thereof.
+// It also reports whether a Pointer was present.
+func receiverNamed(recv *types.Var) (isPtr bool, named *types.Named) {
+	t := recv.Type()
+	if ptr, ok := types.Unalias(t).(*types.Pointer); ok {
+		isPtr = true
+		t = ptr.Elem()
 	}
-}
-
-func hasPointerReceiver(method types.Object) bool {
-	_, ok := receiverType(method).(*types.Pointer)
-	return ok
+	named, _ = types.Unalias(t).(*types.Named)
+	return
 }
